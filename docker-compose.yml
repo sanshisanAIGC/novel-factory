@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  novel-factory:
+    build: .
+    container_name: novel-factory
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "7778:7777"

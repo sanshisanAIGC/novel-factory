@@ -1,0 +1,22 @@
+# 敏感配置文件
+.env
+
+# 数据文件
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试文件
+test_*.py
