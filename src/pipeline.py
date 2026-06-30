@@ -217,10 +217,12 @@ class NovelPipeline:
                 print(f"[Pipeline] 第 {ch_num} 章文件不存在，跳过")
                 continue
 
-            content = filepath.read_text(encoding="utf-8")
+            raw = filepath.read_text(encoding="utf-8")
+            # 从文件第一行提取标题
+            title, content = self._split_title_from_file(raw, ch_num)
             chapters.append({
                 "chapter_num": ch_num,
-                "title": f"第{ch_num}章",
+                "title": title,
                 "content": content,
             })
 
@@ -246,17 +248,19 @@ class NovelPipeline:
         num_chapters: int = 10,
         min_words: int = 2000,
         max_words: int = 3000,
-        auto_sync: bool = True,
+        auto_sync: bool = False,
+        sync_count: int = 0,
         max_revise_rounds: int = 3,
     ) -> dict:
         """
-        运行完整的写作→审核→修改→同步流程
+        运行完整的写作→审核→修改→（可选同步）流程
 
         Args:
             num_chapters: 每批写作章数
             min_words: 每章最少字数
             max_words: 每章最多字数
-            auto_sync: 是否自动同步到飞书
+            auto_sync: 是否自动同步。False=仅标记已审核，由调度器日更3章
+            sync_count: auto_sync=True 时推几章（0=全部，默认由外部决定）
             max_revise_rounds: 最大修改轮数（FAIL 时）
 
         Returns:
@@ -276,14 +280,11 @@ class NovelPipeline:
             revise_rounds += 1
             print(f"\n[Pipeline] 第 {revise_rounds} 轮修改...")
 
-            # 只修改 FAIL 的章节
             for ch_review in review["chapter_reviews"]:
                 if ch_review.get("verdict") == "FAIL":
                     ch_num = ch_review["chapter_number"]
                     self.run_revise_chapter(ch_num, ch_review)
 
-            # 重新审核
-            # 重新读取修改后的章节
             revised_chapters = []
             for ch in chapters:
                 filepath = self.chapters_dir / f"chapter_{ch['chapter_number']:04d}.txt"
@@ -297,11 +298,20 @@ class NovelPipeline:
 
         elapsed = time.time() - start_time
 
-        # Step 4: 同步到飞书
+        # Step 4: 同步到飞书（默认关闭，交给调度器按节奏推送）
         sync_results = []
         if auto_sync and review["batch_verdict"] != "FAIL":
-            chapter_numbers = [c["chapter_number"] for c in chapters]
-            sync_results = self.run_sync_to_feishu(chapter_numbers)
+            all_chapter_numbers = sorted([c["chapter_number"] for c in chapters])
+            if sync_count and sync_count < len(all_chapter_numbers):
+                # 只推指定数量（对齐外部平台章数）
+                to_sync = all_chapter_numbers[:sync_count]
+                print(f"\n[Pipeline] 同步前 {sync_count} 章到飞书: {to_sync}")
+            else:
+                to_sync = all_chapter_numbers
+            sync_results = self.run_sync_to_feishu(to_sync)
+            # 标记已同步到飞书
+            self.state.set("novel.last_synced_feishu_chapter", to_sync[-1])
+            self.state.save()
 
         # Step 5: 打印摘要
         print(f"\n{'='*60}")
@@ -310,7 +320,10 @@ class NovelPipeline:
         print(f"  章节: {chapters[0]['chapter_number']} - {chapters[-1]['chapter_number']}")
         print(f"  审核: {review['batch_verdict']} ({review['batch_score']}/10)")
         print(f"  修改轮数: {revise_rounds}")
-        print(f"  同步: {'成功' if sync_results else '跳过'}")
+        if auto_sync:
+            print(f"  同步: {'成功' if sync_results else '跳过'}")
+        else:
+            print(f"  同步: 交由调度器日更（{num_chapters}章已标记为待发布）")
         print(f"{'='*60}")
 
         return {
@@ -321,6 +334,35 @@ class NovelPipeline:
             "elapsed_seconds": elapsed,
         }
 
+    def get_pending_publish_chapters(self, count: int = 3) -> list[int]:
+        """
+        获取待发布到飞书的章节（从审核通过且未同步的章节中取）
+        用于调度器每日发布
+        """
+        last_synced = self.state.get("novel.last_synced_feishu_chapter", 0)
+        approved = self.state.get_approved_chapters()
+        # 取审核通过、章节号 > 最后同步到飞书的章节号
+        pending = [ch for ch in approved if ch > last_synced]
+        pending.sort()
+        return pending[:count]
+
+    def set_platform_published(self, chapter_count: int):
+        """设置外部平台（番茄小说）已发布的章节数"""
+        self.state.set("novel.published_on_platform", chapter_count)
+        self.state.save()
+        print(f"[Pipeline] 外部平台已发布章节数更新为: {chapter_count}")
+
+    @staticmethod
+    def _split_title_from_file(raw: str, chapter_num: int) -> tuple[str, str]:
+        """从已保存的章节文件中分离标题和正文"""
+        import re
+        lines = raw.strip().split('\n', 1)
+        first = lines[0].strip()
+        # 检查第一行是否是标题（以「第X章」开头）
+        if re.match(r'第[零一二三四五六七八九十百千\d]+章', first):
+            return first, lines[1].strip() if len(lines) > 1 else ""
+        return f"第{chapter_num}章", raw.strip()
+
     # ━━━━ 状态查询 ━━━━
 
     def print_status(self):
@@ -328,15 +370,23 @@ class NovelPipeline:
         stats = self.state.get_stats()
         novel = self.state.get_novel_info()
 
+        platform_pub = novel.get("published_on_platform", 0)
+        last_feishu = novel.get("last_synced_feishu_chapter", 0)
+        pending_feishu = self.get_pending_publish_chapters(99)
+
         print(f"\n{'='*50}")
         print(f"  {novel['title'] or '未命名小说'} - 状态报告")
         print(f"{'='*50}")
-        print(f"  总章节:     {stats['total_chapters']}")
-        print(f"  总字数:     {stats['total_words']:,}")
-        print(f"  平均字数:   {stats['avg_words_per_chapter']}")
-        print(f"  人物数量:   {stats['characters_count']}")
-        print(f"  活跃伏笔:   {stats['active_foreshadowing']}")
-        print(f"  已回收伏笔: {stats['resolved_foreshadowing']}")
-        print(f"  批次数量:   {stats['batches_count']}")
-        print(f"  已审核章数: {stats['approved_chapters']}")
+        print(f"  总章节:       {stats['total_chapters']}")
+        print(f"  总字数:       {stats['total_words']:,}")
+        print(f"  平均字数:     {stats['avg_words_per_chapter']}")
+        print(f"  人物数量:     {stats['characters_count']}")
+        print(f"  活跃伏笔:     {stats['active_foreshadowing']}")
+        print(f"  已回收伏笔:   {stats['resolved_foreshadowing']}")
+        print(f"  批次数量:     {stats['batches_count']}")
+        print(f"  已审核章数:   {stats['approved_chapters']}")
+        print(f"  ─────────────────────────────")
+        print(f"  番茄已发:     第 {platform_pub} 章")
+        print(f"  飞书已同步:   第 {last_feishu} 章")
+        print(f"  待推飞书:     {pending_feishu[:5]}{'...' if len(pending_feishu) > 5 else ''} ({len(pending_feishu)} 章)")
         print(f"{'='*50}")

@@ -31,6 +31,7 @@ WRITE_MIN_WORDS = int(_env("WRITE_MIN_WORDS", "2000"))
 WRITE_MAX_WORDS = int(_env("WRITE_MAX_WORDS", "3000"))
 PUBLISH_DAILY_COUNT = int(_env("PUBLISH_DAILY_COUNT", "3"))
 PUBLISH_TIME = _env("PUBLISH_TIME", "12:00")
+FEISHU_BUFFER_SIZE = int(_env("FEISHU_BUFFER_SIZE", "10"))  # 飞书比番茄多保持的章数
 
 # ━━━━ 路径配置 ━━━━
 BASE_DIR = Path(__file__).parent

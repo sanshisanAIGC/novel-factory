@@ -33,6 +33,8 @@ class NovelState:
                 "current_chapter": 0,
                 "current_volume": 1,
                 "chapters_per_batch": 10,
+                "published_on_platform": 0,      # 外部平台（番茄小说）已发布章数
+                "last_synced_feishu_chapter": 0, # 最后同步到飞书的章节号
             },
             "characters": [],
             "world": {
@@ -279,11 +281,15 @@ class NovelState:
         return batch["batch_id"]
 
     def get_approved_chapters(self) -> list[int]:
-        """获取所有已审核通过的章节号"""
+        """获取所有已审核通过的章节号（去重）"""
+        seen = set()
         approved = []
         for batch in self.data["batches"]:
             if batch["status"] == "approved":
-                approved.extend(batch["chapters"])
+                for ch in batch["chapters"]:
+                    if ch not in seen:
+                        seen.add(ch)
+                        approved.append(ch)
         return sorted(approved)
 
     # ━━━━ 导入已有小说 ━━━━

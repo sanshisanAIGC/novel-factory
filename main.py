@@ -72,7 +72,7 @@ def cmd_init(args):
 
 
 def cmd_run(args):
-    """运行完整流程"""
+    """运行完整流程（写10章+审核，默认不同步——交给调度器日更3章）"""
     pipeline = create_pipeline()
 
     # 检查是否已初始化
@@ -85,7 +85,8 @@ def cmd_run(args):
         num_chapters=args.chapters or WRITE_BATCH_SIZE,
         min_words=args.min_words or WRITE_MIN_WORDS,
         max_words=args.max_words or WRITE_MAX_WORDS,
-        auto_sync=not args.no_sync,
+        auto_sync=args.sync,          # 默认 False，手动 --sync 才同步
+        sync_count=args.sync_count,   # 0=同步全部
         max_revise_rounds=args.max_revise,
     )
 
@@ -146,14 +147,27 @@ def cmd_sync(args):
     if args.chapters:
         ch_nums = [int(c.strip()) for c in args.chapters.split(",")]
     else:
-        # 同步所有已审核未同步的章节
-        ch_nums = pipeline.state.get_approved_chapters()
+        # 取待发布章节
+        count = args.count or 3  # 默认 3 章
+        ch_nums = pipeline.get_pending_publish_chapters(count)
+        if not ch_nums:
+            # 回退：同步所有已审核未同步的章节
+            ch_nums = pipeline.state.get_approved_chapters()
+            # 去掉已同步过的
+            last_synced = pipeline.state.get("novel.last_synced_feishu_chapter", 0)
+            ch_nums = [c for c in ch_nums if c > last_synced]
         if not ch_nums:
             print("没有待同步的章节")
             return
 
     results = pipeline.run_sync_to_feishu(ch_nums)
     success = sum(1 for r in results if r.get("success"))
+    # 更新同步追踪
+    if success > 0 and ch_nums:
+        last = max(ch_nums)
+        if last > pipeline.state.get("novel.last_synced_feishu_chapter", 0):
+            pipeline.state.set("novel.last_synced_feishu_chapter", last)
+            pipeline.state.save()
     print(f"同步完成: {success}/{len(results)} 成功")
 
 
@@ -164,8 +178,30 @@ def cmd_status(args):
     pipeline.print_status()
 
 
+def cmd_platform(args):
+    """设置外部平台已发布章数"""
+    pipeline = create_pipeline()
+    pipeline.set_platform_published(args.chapter)
+    pipeline.print_status()
+
+
+def cmd_buffer(args):
+    """检查/补充飞书缓冲"""
+    from scheduler import BufferManager
+    mgr = BufferManager()
+    status = mgr.get_buffer_status()
+    print(f"\n  番茄已发: 第{status['platform_pub']}章")
+    print(f"  飞书已有: 第{status['feishu_synced']}章")
+    print(f"  缓冲余量: {status['buffer']}/{status['target_buffer']}章")
+    if status["shortage"] > 0:
+        print(f"  → 缓冲不足 {status['shortage']} 章")
+        if args.fill:
+            mgr.replenish_buffer()
+    else:
+        print(f"  → 缓冲充足")
+
 def cmd_schedule(args):
-    """启动定时发布调度器"""
+    """启动定时调度器"""
     from scheduler import run_scheduler
     run_scheduler()
 
@@ -184,11 +220,12 @@ def main():
     p_init.add_argument("--genre", help="小说类型")
 
     # run
-    p_run = subparsers.add_parser("run", help="运行完整流程")
+    p_run = subparsers.add_parser("run", help="运行完整流程（写10章+审核，默认不自动同步）")
     p_run.add_argument("--chapters", type=int, help="每批章节数")
     p_run.add_argument("--min-words", type=int, help="每章最少字数")
     p_run.add_argument("--max-words", type=int, help="每章最多字数")
-    p_run.add_argument("--no-sync", action="store_true", help="不同步到飞书")
+    p_run.add_argument("--sync", action="store_true", help="手动触发同步（默认不同步，交给调度器日更3章）")
+    p_run.add_argument("--sync-count", type=int, default=0, help="同步 N 章（0=全部），对齐外部平台章数时使用")
     p_run.add_argument("--max-revise", type=int, default=3, help="最大修改轮数")
 
     # write
@@ -205,6 +242,15 @@ def main():
     # sync
     p_sync = subparsers.add_parser("sync", help="同步到飞书")
     p_sync.add_argument("--chapters", help="章节号，逗号分隔")
+    p_sync.add_argument("--count", type=int, default=0, help="只推前 N 章（0=全部）")
+
+    # platform — 设置外部平台已发布章数
+    p_platform = subparsers.add_parser("platform", help="设置外部平台（番茄小说）已发布章数")
+    p_platform.add_argument("chapter", type=int, help="外部平台已发布到第几章")
+
+    # buffer — 查看/补充飞书缓冲
+    p_buffer = subparsers.add_parser("buffer", help="查看飞书缓冲状态")
+    p_buffer.add_argument("--fill", action="store_true", help="缓冲不足时自动补写")
 
     # schedule
     subparsers.add_parser("schedule", help="启动定时发布调度器")
@@ -234,6 +280,8 @@ def main():
         "review": cmd_review,
         "sync": cmd_sync,
         "status": cmd_status,
+        "platform": cmd_platform,
+        "buffer": cmd_buffer,
         "schedule": cmd_schedule,
     }
 

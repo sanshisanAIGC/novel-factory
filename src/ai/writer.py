@@ -170,12 +170,15 @@ class AIWriter:
         )
 
         # 调用 API
-        content = self.client.chat_with_retry(
+        raw = self.client.chat_with_retry(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.85,
             max_tokens=max_words * 3,  # 中文约 1.5 字符/token，留足余量
         )
+
+        # 提取标题和正文
+        chapter_title, content = self._extract_title_and_content(raw, chapter_number)
 
         # 清理输出
         content = self._clean_chapter_content(content)
@@ -185,11 +188,34 @@ class AIWriter:
 
         return {
             "chapter_number": chapter_number,
-            "title": chapter_plan.get("core_event", f"第{chapter_number}章")[:30],
+            "title": chapter_title,
             "content": content,
             "word_count": word_count,
             "plan": chapter_plan,
         }
+
+    @staticmethod
+    def _extract_title_and_content(raw: str, chapter_number: int) -> tuple[str, str]:
+        """从 AI 输出中提取章节标题和正文"""
+        raw = raw.strip()
+        # 尝试匹配第一行的「第X章：标题」格式
+        title_pattern = rf'^第\s*{chapter_number}\s*章[：:]\s*(.+)$'
+        m = re.match(title_pattern, raw.split('\n')[0], re.IGNORECASE)
+        if m:
+            title = f"第{chapter_number}章：{m.group(1).strip()}"
+            content = '\n'.join(raw.split('\n')[1:]).strip()
+            return title, content
+
+        # 尝试匹配任意「第X章：标题」格式（AI 可能用了相近的章号）
+        generic_pattern = r'^第[零一二三四五六七八九十百千\d]+章[：:]\s*(.+)$'
+        m = re.match(generic_pattern, raw.split('\n')[0])
+        if m:
+            title = raw.split('\n')[0].strip()
+            content = '\n'.join(raw.split('\n')[1:]).strip()
+            return title, content
+
+        # 没有标题行，使用默认标题
+        return f"第{chapter_number}章", raw
 
     def _clean_chapter_content(self, content: str) -> str:
         """清理 AI 生成的章节内容"""
@@ -197,8 +223,7 @@ class AIWriter:
         content = re.sub(r'^```[a-z]*\s*\n', '', content)
         content = re.sub(r'\n```\s*$', '', content)
 
-        # 移除 AI 可能添加的章节标题
-        content = re.sub(r'^第[零一二三四五六七八九十百千\d]+章[^\n]*\n*', '', content)
+        # 注意：不再移除章节标题——已在 _extract_title_and_content 中提取
 
         # 移除开头和结尾的空白
         content = content.strip()
@@ -206,20 +231,52 @@ class AIWriter:
         return content
 
     def _save_chapter(self, chapter: dict):
-        """保存章节到文件"""
+        """保存章节到文件（含标题头），已存在则跳过"""
         ch_num = chapter["chapter_number"]
         filepath = self.state.chapters_dir / f"chapter_{ch_num:04d}.txt"
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        filepath.write_text(chapter["content"], encoding="utf-8")
-        print(f"  已保存: {filepath.name}")
+
+        if filepath.exists():
+            print(f"  ⚠ 第 {ch_num} 章已存在，跳过覆盖")
+            return
+
+        title = chapter.get("title", f"第{ch_num}章")
+        full_content = f"{title}\n\n{chapter['content']}"
+        filepath.write_text(full_content, encoding="utf-8")
+        print(f"  已保存: {filepath.name} ({title})")
 
     def _update_state_after_chapter(self, chapter: dict, chapter_plan: dict):
-        """写作后更新状态（轻量更新，详细分析由 Editor 完成）"""
+        """写作后更新状态（使用大纲元数据构建结构化摘要）"""
         ch_num = chapter["chapter_number"]
-        summary = chapter["content"][:200] + "..." if len(chapter["content"]) > 200 else chapter["content"]
 
-        event = chapter_plan.get("core_event", "剧情推进")
-        self.state.add_chapter_summary(ch_num, summary, [event])
+        # 构建结构化摘要（不再是 raw 前 200 字！）
+        summary_parts = []
+        core_event = chapter_plan.get("core_event", "")
+        if core_event:
+            summary_parts.append(f"核心事件：{core_event}")
+
+        chars = chapter_plan.get("characters_involved", [])
+        if chars:
+            summary_parts.append(f"出场人物：{'、'.join(chars)}")
+
+        plot_lines = chapter_plan.get("plot_lines_advanced", [])
+        if plot_lines:
+            summary_parts.append(f"推进线索：{'；'.join(plot_lines)}")
+
+        tone = chapter_plan.get("emotional_tone", "")
+        if tone:
+            summary_parts.append(f"情绪基调：{tone}")
+
+        # 同时保留正文前 100 字作为内容快照
+        content_snapshot = chapter["content"][:100].replace("\n", " ")
+
+        summary = "\n".join(summary_parts) if summary_parts else content_snapshot
+        key_events = [
+            core_event,
+            *chapter_plan.get("plot_lines_advanced", []),
+        ]
+
+        self.state.add_chapter_summary(ch_num, summary, [e for e in key_events if e])
 
     @staticmethod
     def _parse_json_response(resp: str) -> dict:

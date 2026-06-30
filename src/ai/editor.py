@@ -147,12 +147,40 @@ class AIEditor:
         ch_num = review.get("chapter_number")
 
         # 提取关键事件
-        for event in review.get("key_events_extracted", []):
+        key_events = review.get("key_events_extracted", [])
+        for event in key_events:
             print(f"[Editor] 第 {ch_num} 章关键事件: {event}")
+
+        # 用审核提取的关键事件更新章节摘要
+        review_summary = review.get("summary", "")
+        if review_summary or key_events:
+            # 找到现有摘要并增强
+            existing = None
+            for s in self.state.data.get("chapter_summaries", []):
+                if s.get("chapter") == ch_num:
+                    existing = s
+                    break
+            if existing:
+                if review_summary:
+                    existing["summary"] = review_summary
+                if key_events:
+                    existing["key_events"] = key_events
+            elif review_summary:
+                self.state.add_chapter_summary(ch_num, review_summary, key_events)
 
         # 添加新人物
         for char in review.get("new_characters", []):
-            print(f"[Editor] 第 {ch_num} 章新人物: {char}")
+            if isinstance(char, dict):
+                self.state.add_character(
+                    name=char.get("name", str(char)),
+                    role=char.get("role", "supporting"),
+                    traits=char.get("traits", []),
+                    description=char.get("description", ""),
+                )
+                print(f"[Editor] 第 {ch_num} 章新人物: {char.get('name', char)}")
+            else:
+                self.state.add_character(name=str(char))
+                print(f"[Editor] 第 {ch_num} 章新人物: {char}")
 
         # 更新伏笔状态
         for fs in review.get("new_foreshadowing", []):
@@ -169,7 +197,17 @@ class AIEditor:
 
         # 更新人物状态变化
         for change in review.get("character_state_changes", []):
+            if isinstance(change, dict):
+                char_name = change.get("name", "")
+                new_status = change.get("new_status", str(change))
+                for c in self.state.data.get("characters", []):
+                    if c.get("name") == char_name:
+                        c["current_status"] = new_status
+                        c["last_appeared_chapter"] = ch_num
+                        break
             print(f"[Editor] 人物状态变化: {change}")
+
+        self.state.save()
 
     @staticmethod
     def _parse_json_response(resp: str) -> dict:
